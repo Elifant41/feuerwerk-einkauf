@@ -36,7 +36,17 @@
       <button data-f="done">Im Korb</button>
       <button data-f="all">Alle</button>
     </div>
-    <input id="search" type="search" placeholder="Suchen" autocomplete="off">
+    <label class="sortsel"><span aria-hidden="true">⇅</span>
+      <select id="sortSel" aria-label="Sortierung">
+        <option value="added">Hinzugefügt</option>
+        <option value="type">Nach Art</option>
+        <option value="name">Name</option>
+        <option value="price">Preis (teuerste zuerst)</option>
+      </select>
+    </label>
+  </div>
+  <div class="filters search-row">
+    <input id="search" type="search" placeholder="In der Liste suchen" autocomplete="off">
   </div>
 
   <main id="list"></main>
@@ -71,9 +81,22 @@
   <!-- Hinzufügen: Katalogsuche -->
   <dialog id="addSheet" class="sheet tall">
     <div class="sheet-head"><b>Produkt hinzufügen</b><button class="icon close" aria-label="Schließen">✕</button></div>
-    <input id="catSearch" type="search" placeholder="Art.-Nr. oder Name (Klásek-Katalog)" autocomplete="off" enterkeyhint="search">
+    <input id="catSearch" type="search" placeholder="Art.-Nr., Name, Effekt, „100 Schuss“ …" autocomplete="off" enterkeyhint="search">
+    <div id="catTypes" class="typechips" role="tablist" aria-label="Art"></div>
+    <div class="cat-opts">
+      <label class="check small"><input type="checkbox" id="catAllowed" checked> Nur erlaubte (F1/F2)</label>
+      <select id="catSort" aria-label="Sortierung">
+        <option value="">Nach Art (Batterien zuerst)</option>
+        <option value="price">Preis aufsteigend</option>
+        <option value="-price">Preis absteigend</option>
+        <option value="-shots">Meiste Schuss</option>
+        <option value="-nem">Meiste NEM</option>
+        <option value="name">Name A–Z</option>
+      </select>
+    </div>
     <div id="catInfo" class="fine"></div>
     <div id="catResults" class="results"></div>
+    <nav id="catPager" class="pager" aria-label="Seiten"></nav>
     <button id="manualBtn" class="wide">Ohne Katalog eintragen</button>
   </dialog>
 
@@ -106,6 +129,9 @@
             <option>F1</option><option>F2</option><option>F3</option><option>F4</option>
             <option>T1</option><option>T2</option><option>P1</option><option>P2</option>
           </select>
+        </label>
+        <label class="span2">Art
+          <select name="type" id="typeSelect"></select>
         </label>
         <label>NEM je Stück (g)<input name="nem" inputmode="decimal"></label>
         <label>Brutto je Stück (g)<input name="gross" inputmode="decimal"></label>

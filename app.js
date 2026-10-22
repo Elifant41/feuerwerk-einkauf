@@ -19,6 +19,39 @@ const fmtG = (g) => (g >= 1000 ? kg(g) : dec(g, 1) + ' g');
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const isHeavy = (hz) => /^1\.[123]/.test(hz || '');
 
+// Produktarten (gleiche Namen wie tools/catalog_de.py) + Suchwörter, damit z. B. „Böller“ oder „Kuchen“ auch findet
+const TYPES = {
+  'Batterien': 'batterie batterien kuchen cake feuerwerksbatterie',
+  'Verbunde': 'verbund verbundfeuerwerk compound batterie',
+  'Raketen': 'rakete raketen rocket',
+  'Single Shots': 'single shot singleshot einzelschuss bombe kugelbombe',
+  'Römische Lichter': 'römisches licht römische kerze roman candle',
+  'Böller & Knallteppiche': 'böller knaller kracher knallteppich',
+  'Fontänen & Vulkane': 'fontäne vulkan brunnen fountain',
+  'Boden- & Flugeffekte': 'bodenwirbel kreisel flieger schwärmer',
+  'Jugend- & Kleinfeuerwerk': 'jugendfeuerwerk kinder knallerbsen kleinfeuerwerk',
+  'Wunderkerzen': 'wunderkerze sparkler',
+  'Rauch & Fackeln': 'rauch fackel bengalo',
+  'Sortimente': 'sortiment set paket',
+  'Zubehör & Fanartikel': 'zubehör fanartikel',
+  'Sonstiges': '',
+};
+const TYPE_NAMES = Object.keys(TYPES);
+// Für eigene Artikel / Shop-Artikel ohne Katalogeintrag: Art aus dem Namen raten
+const GUESS = [
+  [/rakete|rocket/i, 'Raketen'], [/single\s*shot|einzelschuss/i, 'Single Shots'], [/römisch|roman/i, 'Römische Lichter'],
+  [/verbund|compound/i, 'Verbunde'], [/batterie|battery|cake|\d+\s*(schuss|sh|shots?|ran)\b/i, 'Batterien'],
+  [/böller|knaller|kracher|cracker|knallteppich/i, 'Böller & Knallteppiche'], [/fontäne|vulkan|vulcan|fountain/i, 'Fontänen & Vulkane'],
+  [/wunderkerze|sparkler/i, 'Wunderkerzen'], [/rauch|fackel|smoke|bengal/i, 'Rauch & Fackeln'],
+  [/knallerbse|jugend/i, 'Jugend- & Kleinfeuerwerk'], [/sortiment|\bset\b/i, 'Sortimente'],
+];
+const guessType = (name) => GUESS.find(([rx]) => rx.test(name || ''))?.[1] || null;
+let catSync = null; // geladener Katalog (für Art/Übersetzung von Artikeln mit Art.-Nr.)
+let catFailed = false;
+const fromCat = (it) => (it.sku && catSync?.bySku.get(it.sku.toLowerCase())) || null;
+const itemType = (it) => it.type || fromCat(it)?.type || guessType(it.name) || 'Sonstiges';
+const itemDe = (it) => it.nameDe || fromCat(it)?.nameDe || null;
+
 function h(tag, props = {}, ...children) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(props)) {
@@ -39,13 +72,20 @@ function parseNum(s) {
 }
 
 let toastTimer;
-function toast(text, ms = 2200) {
+function toast(text, ms = 2200, action = null) {
   const t = $('toast');
-  t.textContent = text;
+  t.replaceChildren(h('span', {}, text), action ? h('button', {
+    class: 'link', onclick: () => { t.hidden = true; clearTimeout(toastTimer); action.run(); },
+  }, action.label) : null);
   t.hidden = false;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (t.hidden = true), ms);
 }
+// Meldung mit „Rückgängig“: revert() stellt den alten Stand wieder her
+function undoable(text, revert) {
+  toast(text, 5000, { label: 'Rückgängig', run: () => { revert(); commit(); toast('Rückgängig gemacht'); } });
+}
+const short = (s) => (s.length > 28 ? s.slice(0, 26) + '…' : s);
 
 // ---------- Speicher (IndexedDB, Fotos können groß werden) ----------
 const db = new Promise((ok, fail) => {
@@ -66,7 +106,8 @@ async function idb(mode, fn) {
 const load = (k) => idb('readonly', (s) => s.get(k));
 const save = (k, v) => idb('readwrite', (s) => s.put(v, k));
 
-let state = { lists: [], activeId: null, basis: 'all' };
+const DEFAULTS = { basis: 'all', sort: 'added', browse: { allowed: true, sort: '' } };
+let state = { lists: [], activeId: null, ...DEFAULTS };
 let filter = 'open';
 let query = '';
 let summaryOpen = true;
@@ -134,6 +175,9 @@ const TIER = {
 function render() {
   const l = active();
   $('listSelect').replaceChildren(...state.lists.map((x) => h('option', { value: x.id, selected: x === l }, x.name)));
+  $('sortSel').value = state.sort;
+  // Art und Übersetzung kommen für Artikel mit Art.-Nr. aus dem Katalog → einmal nachladen
+  if (!catSync && !catFailed && l.items.some((i) => i.sku)) catalog().then(render).catch(() => { catFailed = true; });
   renderSummary(l);
   renderList(l);
 }
@@ -211,8 +255,18 @@ function renderList(l) {
   const q = norm(query);
   const items = l.items
     .filter((i) => (filter === 'open' ? !i.done : filter === 'done' ? i.done : true))
-    .filter((i) => !q || norm(i.name).includes(q) || norm(i.sku).includes(q));
-  $('list').replaceChildren(...items.map((it) => renderItem(it, s)));
+    .filter((i) => !q || norm(i.name).includes(q) || norm(i.sku).includes(q) || norm(itemDe(i)).includes(q));
+  const name = (i) => itemDe(i) || i.name;
+  if (state.sort === 'name') items.sort((a, b) => name(a).localeCompare(name(b), 'de'));
+  if (state.sort === 'price') items.sort((a, b) => b.price * b.qty - a.price * a.qty);
+  if (state.sort === 'type') {
+    const groups = new Map(TYPE_NAMES.map((t) => [t, []]));
+    for (const it of items) groups.get(itemType(it)).push(it);
+    $('list').replaceChildren(...[...groups].filter(([, g]) => g.length).flatMap(([t, g]) => [
+      h('h3', { class: 'group' }, t, h('span', {}, `${g.length} Artikel · ${g.reduce((n, i) => n + i.qty, 0)} Stück`)),
+      ...g.map((it) => renderItem(it, s)),
+    ]));
+  } else $('list').replaceChildren(...items.map((it) => renderItem(it, s)));
 
   const e = $('empty');
   e.hidden = items.length > 0;
@@ -233,10 +287,12 @@ function renderItem(it, s) {
     it.qty = Math.max(1, it.qty + d);
     commit();
   };
+  const de = itemDe(it);
   return h('article', { class: 'item' + (it.done ? ' done' : '') + (blocked ? ' blocked' : ''), onclick: () => openItem(it) },
     thumb,
     h('div', { class: 'body' },
       h('div', { class: 'name' }, it.name),
+      de ? h('div', { class: 'de' }, '≈ ' + de) : null,
       it.sku ? h('div', { class: 'sku' }, it.sku) : null,
       chipsFor(it),
       h('div', { class: 'line2' },
@@ -255,6 +311,7 @@ function renderItem(it, s) {
         it.done = !it.done;
         if (navigator.vibrate) navigator.vibrate(10);
         commit();
+        undoable(`„${short(it.name)}“ ${it.done ? 'im Korb' : 'wieder offen'}`, () => { it.done = !it.done; });
       },
     }, '✓'),
   );
@@ -286,6 +343,7 @@ $('filterSeg').addEventListener('click', (e) => {
   render();
 });
 $('search').addEventListener('input', (e) => { query = e.target.value; render(); });
+$('sortSel').addEventListener('change', (e) => { state.sort = e.target.value; commit(); });
 
 // Menü
 for (const d of document.querySelectorAll('dialog.sheet')) {
@@ -326,18 +384,27 @@ $('mBudget').addEventListener('click', () => {
 });
 $('mUncheck').addEventListener('click', () => {
   const l = active();
-  if (!l.items.some((i) => i.done) || !confirm('Alle Haken dieser Liste entfernen?')) return;
+  const was = l.items.filter((i) => i.done);
+  if (!was.length || !confirm('Alle Haken dieser Liste entfernen?')) return;
   for (const i of l.items) i.done = false;
+  $('menu').close();
   commit();
+  undoable(`${was.length} Haken entfernt`, () => { for (const i of was) i.done = true; });
 });
 $('mDelete').addEventListener('click', () => {
   const l = active();
   if (!confirm(`Liste „${l.name}“ mit ${l.items.length} Artikeln löschen?`)) return;
+  const idx = state.lists.indexOf(l);
   state.lists = state.lists.filter((x) => x !== l);
-  if (!state.lists.length) newList('Einkauf');
+  const filler = state.lists.length ? null : newList('Einkauf');
   state.activeId = state.lists[0].id;
   $('menu').close();
   commit();
+  undoable(`Liste „${short(l.name)}“ gelöscht`, () => {
+    if (filler && !filler.items.length) state.lists = state.lists.filter((x) => x !== filler);
+    state.lists.splice(Math.min(idx, state.lists.length), 0, l);
+    state.activeId = l.id;
+  });
 });
 
 // ---------- Import / Export ----------
@@ -348,12 +415,17 @@ $('importFile').addEventListener('change', async (e) => {
   if (!file) return;
   try {
     const text = await file.text();
+    const prev = state.activeId;
     const l = /^\s*[{[]/.test(text) ? importJson(JSON.parse(text)) : await importCsv(text, file.name);
     $('menu').close();
     filter = 'open';
     for (const b of $('filterSeg').children) b.classList.toggle('on', b.dataset.f === 'open');
     commit();
-    toast(`„${l.name}“ importiert: ${l.items.length} Artikel`);
+    undoable(`„${short(l.name)}“ importiert: ${l.items.length} Artikel`, () => {
+      state.lists = state.lists.filter((x) => x !== l);
+      state.activeId = state.lists.some((x) => x.id === prev) ? prev : state.lists[0]?.id;
+      if (!state.lists.length) newList('Einkauf');
+    });
   } catch (err) {
     toast('Import fehlgeschlagen: ' + err.message, 5000);
   }
@@ -366,6 +438,7 @@ const cleanItem = (x) => ({
   nem: x.nem != null && x.nem !== '' ? Number(x.nem) : null, gross: x.gross != null && x.gross !== '' ? Number(x.gross) : null,
   image: typeof x.image === 'string' ? x.image : null, url: x.url || null, shop: x.shop || null,
   priceNote: x.priceNote || null, done: !!x.done, czk: Number(x.czk) || null,
+  type: TYPE_NAMES.includes(x.type) ? x.type : null, nameDe: x.nameDe || null, effect: x.effect || null,
 });
 
 function importJson(d) {
@@ -427,60 +500,150 @@ function catalog() {
     return r.json();
   }).then((d) => {
     const bySku = new Map();
-    for (const p of d.products) {
-      p._key = norm(p.sku) + ' ' + norm(p.name);
+    d.products.forEach((p, i) => {
+      p._i = i;
+      p.type = TYPE_NAMES.includes(p.type) ? p.type : guessType(p.name) || 'Sonstiges';
+      // _main: Art.-Nr. und Namen (für die Rangfolge), _key: zusätzlich Effekt (deutsch), Art, Kaliber
+      p._main = [p.sku, p.name, p.nameDe].map(norm).join(' ');
+      p._key = p._main + ' ' + [p.effect, p.type, TYPES[p.type], p.cal].map(norm).join(' ');
       bySku.set(p.sku.toLowerCase(), p);
-    }
-    return { ...d, bySku };
+    });
+    catSync = { ...d, bySku };
+    return catSync;
   }).catch((e) => { catalogP = null; throw e; });
   return catalogP;
 }
 
+const PAGE = 20;
+const browse = { type: '', page: 0, hits: [] };
+
 function openAdd() {
   $('catSearch').value = '';
+  $('catAllowed').checked = state.browse.allowed;
+  $('catSort').value = state.browse.sort;
+  browse.type = '';
   $('catResults').replaceChildren();
+  $('catPager').replaceChildren();
+  $('catTypes').replaceChildren();
   $('addSheet').showModal();
+  $('addSheet').scrollTop = 0;
   $('catInfo').textContent = 'Katalog wird geladen …';
-  catalog().then((c) => {
-    $('catInfo').textContent = `${c.source}: ${c.products.length} Artikel · Stand ${c.builtAt}`;
-    searchCatalog();
-  }).catch(() => { $('catInfo').textContent = 'Katalog nicht verfügbar (offline?) – „Ohne Katalog eintragen“ geht trotzdem.'; });
+  catalog().then(() => searchCatalog())
+    .catch(() => { $('catInfo').textContent = 'Katalog nicht verfügbar (offline?) – „Ohne Katalog eintragen“ geht trotzdem.'; });
 }
 $('addBtn').addEventListener('click', openAdd);
 $('manualBtn').addEventListener('click', () => { $('addSheet').close(); openItem(null); });
 
+// Suche + Filter → Trefferliste (alle Seiten). Ohne Suchwort: ganzer Katalog zum Durchblättern.
 async function searchCatalog() {
-  const q = norm($('catSearch').value);
   const c = await catalog().catch(() => null);
   if (!c) return;
-  if (q.length < 2) { $('catResults').replaceChildren(); return; }
-  const words = $('catSearch').value.split(/\s+/).map(norm).filter(Boolean);
-  const hits = c.products
-    .filter((p) => words.every((w) => p._key.includes(w)))
-    .sort((a, b) => (norm(b.sku).startsWith(q) - norm(a.sku).startsWith(q)) || a.sku.localeCompare(b.sku))
-    .slice(0, 50);
+  let raw = $('catSearch').value;
+  let shots = null, cal = null;
+  raw = raw.replace(/(\d+)\s*(?:schuss|schüsse|sch|sh|shots?|ran)\b/i, (_, n) => { shots = Number(n); return ' '; });
+  raw = raw.replace(/(\d+)\s*mm\b/i, (_, n) => { cal = Number(n); return ' '; });
+  const words = raw.split(/\s+/).map(norm).filter(Boolean);
+  const q = norm(raw);
+
+  const base = c.products.filter((p) =>
+    (!state.browse.allowed || !blockReasons(p).length)
+    && (shots == null || p.shots === shots)
+    && (cal == null || String(p.cal || '').split('+').some((x) => parseInt(x) === cal))
+    && words.every((w) => p._key.includes(w)));
+
+  const counts = new Map();
+  for (const p of base) counts.set(p.type, (counts.get(p.type) || 0) + 1);
+  if (browse.type && !counts.get(browse.type)) browse.type = '';
+  $('catTypes').replaceChildren(
+    h('button', { class: browse.type ? '' : 'on', onclick: () => setType('') }, `Alle ${base.length}`),
+    ...TYPE_NAMES.filter((t) => counts.get(t)).map((t) =>
+      h('button', { class: browse.type === t ? 'on' : '', onclick: () => setType(t) }, `${t} ${counts.get(t)}`)),
+  );
+
+  let hits = browse.type ? base.filter((p) => p.type === browse.type) : base;
+  // Rangfolge bei Suche: Art.-Nr. beginnt mit dem Suchwort > Treffer im Namen > Treffer in Effekt/Art
+  const rank = (p) => (q && p._main.startsWith(q) ? 2 : 0) + (words.length && words.every((w) => p._main.includes(w)) ? 1 : 0);
+  const sk = state.browse.sort.replace('-', ''), dir = state.browse.sort.startsWith('-') ? -1 : 1;
+  const val = (p) => (sk === 'price' ? p.price || null : sk === 'shots' ? p.shots : sk === 'nem' ? p.nem : null);
+  hits = [...hits].sort((a, b) => {
+    if (words.length) { const r = rank(b) - rank(a); if (r) return r; }
+    if (sk === 'name') return a.name.localeCompare(b.name, 'de');
+    if (sk) {
+      const va = val(a), vb = val(b);
+      if (va == null || vb == null) return (va == null) - (vb == null);
+      if (va !== vb) return (va - vb) * dir;
+    }
+    return TYPE_NAMES.indexOf(a.type) - TYPE_NAMES.indexOf(b.type) || a._i - b._i;
+  });
+  browse.hits = hits;
+  browse.page = 0;
+  renderPage();
+}
+
+function setType(t) {
+  browse.type = t;
+  searchCatalog();
+}
+
+function renderPage() {
+  const hits = browse.hits;
+  const pages = Math.max(1, Math.ceil(hits.length / PAGE));
+  browse.page = Math.min(browse.page, pages - 1);
+  const from = browse.page * PAGE;
   const inList = new Set(active().items.map((i) => (i.sku || '').toLowerCase()));
+  $('catInfo').textContent = hits.length
+    ? `${hits.length} Artikel${pages > 1 ? ` · Seite ${browse.page + 1} von ${pages}` : ''} · ${catSync.source}, Stand ${catSync.builtAt}`
+    : '';
   $('catResults').replaceChildren(
-    ...hits.map((p) => {
+    ...hits.slice(from, from + PAGE).map((p) => {
       const r = blockReasons(p);
       return h('button', { class: 'res' + (r.length ? ' blocked' : ''), onclick: () => { $('addSheet').close(); openItem(null, p); } },
         p.image ? h('img', { class: 'thumb', src: p.image, alt: '', loading: 'lazy' }) : h('div', { class: 'thumb none' }, '🎆'),
-        h('div', {},
+        h('div', { class: 'body' },
           h('div', { class: 'name' }, p.name),
-          h('div', { class: 'sku' }, p.sku, inList.has(p.sku.toLowerCase()) ? ' · ✓ auf der Liste' : ''),
-          h('div', { class: 'meta' }, r.length ? '⚠ ' + r.join(', ') : [p.cat, p.hazard, p.nem != null ? 'NEM ' + fmtG(p.nem) : null, p.gross != null ? 'brutto ' + fmtG(p.gross) : null, p.czk ? `${dec(p.czk, 0)} Kč` : null].filter(Boolean).join(' · ')),
+          p.nameDe ? h('div', { class: 'de' }, '≈ ' + p.nameDe) : null,
+          h('div', { class: 'sku' }, p.sku, h('span', { class: 'type' }, ' · ' + p.type), inList.has(p.sku.toLowerCase()) ? h('span', { class: 'onlist' }, ' · ✓ auf der Liste') : null),
+          p.effect ? h('div', { class: 'effect' }, p.effect) : null,
+          h('div', { class: 'meta' }, r.length ? '⚠ ' + r.join(', ') : [p.cat, p.hazard, p.shots ? `${p.shots} Schuss` : null, p.cal, p.nem != null ? 'NEM ' + fmtG(p.nem) : null, p.czk ? `${dec(p.czk, 0)} Kč` : null].filter(Boolean).join(' · ')),
         ));
     }),
-    hits.length ? '' : h('div', { class: 'fine' }, 'Nichts gefunden – „Ohne Katalog eintragen“ nutzen.'),
+    hits.length ? '' : h('div', { class: 'fine' }, state.browse.allowed
+      ? 'Nichts gefunden. Evtl. „Nur erlaubte“ ausschalten – oder „Ohne Katalog eintragen“.'
+      : 'Nichts gefunden – „Ohne Katalog eintragen“ nutzen.'),
   );
+  renderPager(pages);
 }
-$('catSearch').addEventListener('input', searchCatalog);
+
+// Seitenleiste: ‹ 1 … 4 5 6 … 12 ›
+function renderPager(pages) {
+  const p = browse.page;
+  const go = (i) => () => {
+    browse.page = i;
+    renderPage();
+    $('addSheet').scrollTo({ top: $('catTypes').offsetTop - 64 });
+  };
+  if (pages < 2) return $('catPager').replaceChildren();
+  const nums = [...new Set([0, p - 1, p, p + 1, pages - 1])].filter((i) => i >= 0 && i < pages).sort((a, b) => a - b);
+  const out = [h('button', { disabled: p === 0, onclick: go(p - 1), 'aria-label': 'Vorherige Seite' }, '‹')];
+  nums.forEach((i, k) => {
+    if (k && i - nums[k - 1] > 1) out.push(h('span', { class: 'gap' }, '…'));
+    out.push(h('button', { class: i === p ? 'on' : '', onclick: go(i), 'aria-current': i === p ? 'page' : null }, String(i + 1)));
+  });
+  out.push(h('button', { disabled: p === pages - 1, onclick: go(p + 1), 'aria-label': 'Nächste Seite' }, '›'));
+  $('catPager').replaceChildren(...out);
+}
+
+$('catSearch').addEventListener('input', () => searchCatalog());
+$('catAllowed').addEventListener('change', (e) => { state.browse.allowed = e.target.checked; commit(); searchCatalog(); });
+$('catSort').addEventListener('change', (e) => { state.browse.sort = e.target.value; commit(); searchCatalog(); });
 
 // ---------- Artikel-Formular ----------
 let editing = null; // bestehender Artikel oder null (neu)
 let formImage = null;
 let formCzk = null; // Kč-Preis aus dem Katalog (Preisschild im Laden)
+let formExtra = {}; // Übersetzung und Effekt aus dem Katalog
 const form = $('itemForm');
+form.type.replaceChildren(h('option', { value: '' }, 'automatisch'), ...TYPE_NAMES.map((t) => h('option', {}, t)));
 
 function openItem(it, fromCatalog = null) {
   editing = it;
@@ -495,6 +658,8 @@ function openItem(it, fromCatalog = null) {
   form.sku.value = src.sku || '';
   form.hazard.value = src.hazard || '';
   form.cat.value = src.cat || '';
+  form.type.value = src.type || (it && fromCat(it)?.type) || '';
+  formExtra = { nameDe: src.nameDe || (it && fromCat(it)?.nameDe) || null, effect: src.effect || null };
   form.nem.value = src.nem != null ? inp(src.nem, 3) : '';
   form.gross.value = src.gross != null ? inp(src.gross, 0) : '';
   form.price.value = src.price ? inp(src.price, 2) : '';
@@ -557,6 +722,7 @@ function readForm() {
     nem: parseNum(form.nem.value), gross: parseNum(form.gross.value),
     price: parseNum(form.price.value) || 0, qty: Math.max(1, parseInt(form.qty.value) || 1),
     done: form.done.checked, image: formImage, czk: formCzk,
+    type: form.type.value || null, ...formExtra,
   };
 }
 
@@ -588,26 +754,36 @@ form.addEventListener('submit', (e) => {
   const x = readForm();
   if (!x.name) return form.name.focus();
   const l = active();
-  if (editing) Object.assign(editing, x);
-  else l.items.push({ id: uid(), url: null, shop: 'Eigene Einträge', priceNote: null, ...x });
+  const target = editing;
   $('itemSheet').close();
-  commit();
-  if (!editing) toast(x.done ? 'Hinzugefügt und abgehakt' : 'Hinzugefügt');
+  if (target) {
+    const before = { ...target };
+    Object.assign(target, x);
+    commit();
+    undoable('Gespeichert', () => Object.assign(target, before));
+  } else {
+    const added = { id: uid(), url: null, shop: 'Eigene Einträge', priceNote: null, ...x };
+    l.items.push(added);
+    commit();
+    undoable(x.done ? 'Hinzugefügt und abgehakt' : 'Hinzugefügt', () => { l.items = l.items.filter((i) => i !== added); });
+  }
 });
 
 $('itemDelete').addEventListener('click', () => {
   if (!editing || !confirm(`„${editing.name}“ löschen?`)) return;
   const l = active();
-  l.items = l.items.filter((i) => i !== editing);
+  const gone = editing, idx = l.items.indexOf(gone);
+  l.items = l.items.filter((i) => i !== gone);
   $('itemSheet').close();
   commit();
+  undoable(`„${short(gone.name)}“ gelöscht`, () => l.items.splice(idx, 0, gone));
 });
 
 // ---------- Start ----------
 (async () => {
   try {
     const s = await load('state');
-    if (s?.lists?.length) state = { basis: 'all', ...s };
+    if (s?.lists?.length) state = { ...DEFAULTS, ...s, browse: { ...DEFAULTS.browse, ...s.browse } };
   } catch (e) {
     toast('Speicher nicht verfügbar: ' + e.message, 5000);
   }
@@ -621,5 +797,15 @@ $('itemDelete').addEventListener('click', () => {
   if (ios && !standalone && localStorage.getItem('hideInstall') !== '1') $('installHint').hidden = false;
   $('installHide').addEventListener('click', () => { $('installHint').hidden = true; try { localStorage.setItem('hideInstall', '1'); } catch {} });
 
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  // Offline-Cache. Neue Version (sw.js geändert) → Hinweis mit „Neu laden“
+  if ('serviceWorker' in navigator) {
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (hadController) toast('Neue Version der App ist da', 30000, { label: 'Neu laden', run: () => location.reload() });
+    });
+    navigator.serviceWorker.register('sw.js').then((reg) => {
+      // Vom Home-Bildschirm wird die App oft nur fortgesetzt, nicht neu geladen → beim Zurückkehren nach Updates schauen
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) reg.update().catch(() => {}); });
+    }).catch(() => {});
+  }
 })();
